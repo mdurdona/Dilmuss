@@ -1,0 +1,16 @@
+{
+  "name": "dilmuss",
+  "private": true,
+  "version": "0.1.0",
+  "scripts": {
+    "dev:backend": "pnpm --filter @dilmuss/backend dev",
+    "dev:frontend": "pnpm --filter @dilmuss/frontend dev",
+    "dev": "pnpm run -r --parallel dev",
+    "build": "pnpm run -r build",
+    "prisma:generate": "pnpm --filter @dilmuss/backend prisma:generate",
+    "prisma:migrate": "pnpm --filter @dilmuss/backend prisma:migrate",
+    "prisma:seed": "pnpm --filter @dilmuss/backend prisma:seed",
+    "prisma:studio": "pnpm --filter @dilmuss/backend prisma:studio"
+  },
+  "packageManager": "pnpm@11.18.0"
+}

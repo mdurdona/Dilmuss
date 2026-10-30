@@ -1,0 +1,89 @@
+@import "tailwindcss";
+
+@custom-variant dark (&:where(.dark, .dark *));
+
+:root {
+  --background: #fdf7f5;
+  --foreground: #241a1d;
+  --surface: #ffffff;
+
+  --color-primary: #e0447a;
+  --color-primary-dark: #b52f5f;
+  --color-primary-light: #f8d9e3;
+  --color-cream: #fdf7f5;
+  --color-ink: #241a1d;
+  --color-muted: #8a7a7d;
+  --color-border: #f0dfe1;
+}
+
+:root.dark {
+  /* Neytral kulrang fon/karta/chegara — faqat brend pushti rangi aksent sifatida qoladi,
+     shunda ular bir-biriga "yuvilib" aralashib ketmaydi. */
+  --background: #141416;
+  --foreground: #f2f1f2;
+  --surface: #1e1e21;
+
+  --color-primary: #ec5089;
+  --color-primary-dark: #d63d70;
+  --color-primary-light: #2c2329;
+  --color-cream: #141416;
+  --color-ink: #f2f1f2;
+  --color-muted: #9d9ba0;
+  --color-border: #2a2a2e;
+}
+
+@theme inline {
+  --color-background: var(--background);
+  --color-foreground: var(--foreground);
+  --color-surface: var(--surface);
+  --color-brand: var(--color-primary);
+  --color-brand-dark: var(--color-primary-dark);
+  --color-brand-light: var(--color-primary-light);
+  --color-cream: var(--color-cream);
+  --color-ink: var(--color-ink);
+  --color-muted: var(--color-muted);
+  --color-line: var(--color-border);
+  --font-sans: var(--font-body);
+  --font-display: var(--font-heading);
+}
+
+* {
+  border-color: var(--color-border);
+}
+
+body {
+  background: var(--background);
+  color: var(--foreground);
+  font-family: var(--font-body), Arial, Helvetica, sans-serif;
+  transition: background-color 0.15s ease, color 0.15s ease;
+}
+
+h1,
+h2,
+h3,
+h4,
+.font-display {
+  font-family: var(--font-heading), Georgia, serif;
+}
+
+.no-scrollbar::-webkit-scrollbar {
+  display: none;
+}
+.no-scrollbar {
+  -ms-overflow-style: none;
+  scrollbar-width: none;
+}
+
+.input {
+  width: 100%;
+  border: 1px solid var(--color-border);
+  border-radius: 0.5rem;
+  padding: 0.6rem 0.8rem;
+  font-size: 0.875rem;
+  background: var(--surface);
+  color: var(--color-ink);
+}
+.input:focus {
+  outline: 2px solid var(--color-primary);
+  outline-offset: 1px;
+}

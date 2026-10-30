@@ -1,0 +1,957 @@
+// ============================================================================
+// Ayollar kiyim do'koni — ko'p filialli E-commerce va markazlashgan boshqaruv
+// Prisma schema (PostgreSQL) — TZ "Birlashtirilgan va optimallashtirilgan versiya" asosida
+//
+// DB darajasidagi invariantlar (TZ 4.7) faqat schema ichida, "marker" ustunlar orqali:
+// nullable @unique ustunda NULL lar bir-biriga to'sqinlik qilmaydi, faqat `true` yagona bo'ladi.
+// Marker'ni service-code belgilaydi (tegishli holat bo'lsa true, aks holda null).
+// CHECK constraint'lar (stock >= 0 va h.k.) Prisma'da yo'q — service/transaction darajasida.
+//
+// Pul qiymatlari: butun son, so'mda (UZS). Payme/Click tiyinda ishlaydi —
+// konvertatsiya faqat payment provider adapterida (×100 / ÷100) bajariladi.
+// ============================================================================
+
+generator client {
+  provider        = "prisma-client-js"
+  previewFeatures = ["postgresqlExtensions"]
+}
+
+datasource db {
+  provider   = "postgresql"
+  url        = env("DATABASE_URL")
+  extensions = [pg_trgm]
+}
+
+// ============================================================================
+// ENUMLAR
+// ============================================================================
+
+enum UserRole {
+  SUPERADMIN // tizimda faqat 1 ta ACTIVE (activeSuperadminMarker)
+  ADMIN
+  CUSTOMER
+}
+
+enum UserStatus {
+  ACTIVE
+  INACTIVE
+  BLOCKED
+}
+
+/// TZ 4.3 — Admin qaysi filiallarga kira oladi
+enum BranchScope {
+  OWN_BRANCH
+  SELECTED_BRANCHES
+  ALL_BRANCHES
+}
+
+/// TZ 4.6 — RolePermission ustiga individual GRANT / REVOKE
+enum OverrideEffect {
+  GRANT
+  REVOKE
+}
+
+/// TZ 4.2 — permissionlar ro'yxati (seed orqali `Permission` jadvaliga kiritiladi)
+enum PermissionCode {
+  PRODUCT_VIEW
+  PRODUCT_CREATE
+  PRODUCT_UPDATE
+  PRODUCT_DELETE
+  ORDER_VIEW
+  ORDER_UPDATE
+  ORDER_CANCEL
+  ORDER_REFUND
+  CUSTOMER_VIEW
+  CUSTOMER_UPDATE
+  INVENTORY_VIEW
+  INVENTORY_UPDATE
+  PAYMENT_VIEW
+  PAYMENT_VERIFY
+  PAYMENT_REFUND
+  DELIVERY_VIEW
+  DELIVERY_UPDATE
+  REPORT_VIEW
+  ADMIN_VIEW
+  ADMIN_CREATE
+  ADMIN_UPDATE
+  ADMIN_DELETE
+  BRANCH_VIEW
+  BRANCH_CREATE
+  BRANCH_UPDATE
+  PERMISSION_VIEW
+  PERMISSION_UPDATE
+  AUDIT_LOG_VIEW
+  SYSTEM_SETTINGS_VIEW
+  SYSTEM_SETTINGS_UPDATE
+}
+
+enum ProductStatus {
+  ACTIVE
+  ARCHIVED // hard delete yo'q, TZ 6.1
+}
+
+enum DiscountType {
+  PERCENT
+  AMOUNT
+}
+
+enum InventoryMovementReason {
+  INITIAL_STOCK
+  MANUAL_ADJUSTMENT
+  ORDER_SALE
+  ORDER_CANCEL_RESTOCK
+  RETURN
+  TRANSFER_OUT
+  TRANSFER_IN
+  DAMAGE_LOSS
+  CORRECTION
+}
+
+enum ReservationStatus {
+  ACTIVE
+  CONSUMED // to'lov tasdiqlandi, onHand kamaytirildi
+  RELEASED // order bekor qilindi
+  EXPIRED // timeout (default 15 daqiqa)
+}
+
+/// TZ 13.5 — keyingi bosqich
+enum StockTransferStatus {
+  REQUESTED
+  APPROVED
+  IN_TRANSIT
+  RECEIVED
+  CANCELLED
+}
+
+/// TZ 11.2 — Order Status (Payment Status'dan mustaqil state machine)
+enum OrderStatus {
+  PENDING_PAYMENT
+  MANUAL_REVIEW // TZ 11.3 — hech bir filialda barcha item birga yo'q
+  CONFIRMED
+  PROCESSING
+  PACKED
+  SHIPPED
+  DELIVERED
+  CANCELLED
+}
+
+/// TZ 11.2 + 11.4 — Payment Status
+enum PaymentStatus {
+  PENDING
+  PAID
+  REFUND_REQUESTED
+  REFUNDED
+  PARTIALLY_REFUNDED
+  FAILED
+  EXPIRED
+}
+
+enum PaymentProvider {
+  PAYME
+  CLICK
+}
+
+enum PaymentTransactionType {
+  INIT
+  PREPARE
+  COMPLETE
+  CANCEL
+  REFUND
+}
+
+enum PaymentTransactionStatus {
+  RECEIVED
+  PROCESSED
+  REJECTED
+}
+
+enum OrderSource {
+  INSTAGRAM
+  TELEGRAM
+  WEBSITE
+  OTHER
+}
+
+enum AddressMethod {
+  GPS
+  MAP_PIN
+  MANUAL
+}
+
+enum DeliveryStatus {
+  PENDING
+  IN_TRANSIT
+  DELIVERED
+  FAILED
+  RETURNED
+}
+
+enum NotificationType {
+  ERROR
+  PAYMENT_WEBHOOK_ERROR
+  DATABASE_ERROR
+  CRITICAL_EXCEPTION
+  SERVER_ERROR
+  NEW_ORDER
+  PAYMENT_RECEIVED
+  LOW_STOCK
+  ORDER_STATUS_CHANGED // mijozga SMS (TZ 20.2)
+  PHONE_VERIFICATION // ro'yxatdan o'tishda OTP (TZ'dan tashqari qo'shildi)
+}
+
+enum NotificationChannel {
+  TELEGRAM
+  EMAIL
+  SMS
+  PUSH
+}
+
+enum NotificationStatus {
+  PENDING
+  SENT
+  FAILED
+}
+
+enum AuditAction {
+  CREATE
+  UPDATE
+  DELETE
+  ARCHIVE
+  STATUS_CHANGE
+  LOGIN
+  LOGOUT
+  FAILED_LOGIN
+  PERMISSION_CHANGED
+  ROLE_CHANGED
+  BRANCH_SCOPE_CHANGED
+}
+
+// ============================================================================
+// 1. FOYDALANUVCHI, ROL, PERMISSION (TZ 3, 4, 15)
+// ============================================================================
+
+model User {
+  id           String     @id @default(cuid())
+  role         UserRole   @default(CUSTOMER)
+  status       UserStatus @default(ACTIVE)
+  fullName     String
+  phone        String     @unique
+  email        String?    @unique
+  passwordHash String
+
+  /// Faqat ADMIN uchun ahamiyatli. SUPERADMIN = ALL_BRANCHES.
+  /// SELECTED_BRANCHES / OWN_BRANCH bo'lsa ruxsat etilgan filiallar UserBranch'da.
+  branchScope BranchScope @default(OWN_BRANCH)
+
+  // Brute-force himoyasi (TZ 17)
+  failedLoginCount Int       @default(0)
+  lockedUntil      DateTime?
+  lastLoginAt      DateTime?
+
+  /// SUPERADMIN yagonaligi: role=SUPERADMIN va status=ACTIVE bo'lsa true, aks holda NULL bo'lishi shart.
+  /// @unique tufayli bazada ikkinchi ACTIVE SUPERADMIN bo'lishi mumkin emas (TZ 4.7).
+  activeSuperadminMarker Boolean? @unique
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  roleDef             Role                     @relation(fields: [role], references: [code])
+  sessions            Session[]
+  branches            UserBranch[]
+  permissionOverrides UserPermissionOverride[] @relation("OverrideTarget")
+  grantedOverrides    UserPermissionOverride[] @relation("OverrideGrantedBy")
+  addresses           Address[]
+  cart                Cart?
+  favorites           Favorite[]
+  orders              Order[]
+  orderStatusChanges  OrderStatusHistory[]
+  inventoryMovements  InventoryMovement[]
+  transfersRequested  StockTransfer[]          @relation("TransferRequestedBy")
+  transfersApproved   StockTransfer[]          @relation("TransferApprovedBy")
+  transfersReceived   StockTransfer[]          @relation("TransferReceivedBy")
+  auditLogs           AuditLog[]
+  updatedSettings     SystemSetting[]
+
+  @@index([role, status])
+}
+
+/// UserRole enum'i bilan 1:1. Seed orqali 3 ta yozuv: SUPERADMIN, ADMIN, CUSTOMER.
+model Role {
+  id          String   @id @default(cuid())
+  code        UserRole @unique
+  name        String
+  description String?
+
+  users       User[]
+  permissions RolePermission[]
+}
+
+model Permission {
+  id          String         @id @default(cuid())
+  code        PermissionCode @unique
+  module      String // "PRODUCT", "ORDER", ...
+  description String?
+
+  roles     RolePermission[]
+  overrides UserPermissionOverride[]
+}
+
+model RolePermission {
+  roleId       String
+  permissionId String
+
+  role       Role       @relation(fields: [roleId], references: [id], onDelete: Cascade)
+  permission Permission @relation(fields: [permissionId], references: [id], onDelete: Cascade)
+
+  @@id([roleId, permissionId])
+  @@index([permissionId])
+}
+
+/// TZ 4.6 — yakuniy ruxsat = RolePermission ± UserPermissionOverride
+model UserPermissionOverride {
+  id           String         @id @default(cuid())
+  userId       String
+  permissionId String
+  effect       OverrideEffect
+  grantedById  String?
+  createdAt    DateTime       @default(now())
+
+  user       User       @relation("OverrideTarget", fields: [userId], references: [id], onDelete: Cascade)
+  permission Permission @relation(fields: [permissionId], references: [id], onDelete: Cascade)
+  grantedBy  User?      @relation("OverrideGrantedBy", fields: [grantedById], references: [id], onDelete: SetNull)
+
+  @@unique([userId, permissionId])
+  @@index([permissionId])
+}
+
+/// TZ 15.2 — har bir login uchun alohida session/device
+model Session {
+  id               String    @id @default(cuid())
+  userId           String
+  refreshTokenHash String    @unique // xom token emas, hash
+  userAgent        String?
+  ipAddress        String?
+  createdAt        DateTime  @default(now())
+  lastUsedAt       DateTime  @default(now())
+  expiresAt        DateTime
+  revokedAt        DateTime?
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId, revokedAt])
+  @@index([expiresAt])
+}
+
+/// TZ'dan tashqari qo'shildi — ro'yxatdan o'tishda telefon raqamini OTP orqali tasdiqlash.
+model PhoneVerification {
+  id         String    @id @default(cuid())
+  phone      String
+  codeHash   String
+  attempts   Int       @default(0)
+  consumedAt DateTime?
+  expiresAt  DateTime
+  createdAt  DateTime  @default(now())
+
+  @@index([phone])
+}
+
+/// TZ'dan tashqari qo'shildi — sevimli mahsulotlar ("Saralangan"), faqat ro'yxatdan o'tgan foydalanuvchilar uchun.
+model Favorite {
+  id        String   @id @default(cuid())
+  userId    String
+  productId String
+  createdAt DateTime @default(now())
+
+  user    User    @relation(fields: [userId], references: [id], onDelete: Cascade)
+  product Product @relation(fields: [productId], references: [id], onDelete: Cascade)
+
+  @@unique([userId, productId])
+  @@index([userId])
+}
+
+// ============================================================================
+// 2. FILIALLAR (TZ 3.2)
+// ============================================================================
+
+model Branch {
+  id         String   @id @default(cuid())
+  name       String
+  code       String   @unique
+  region     String
+  city       String
+  address    String?
+  phone      String?
+  isMain     Boolean  @default(false)
+  /// Yagona Main Branch: isMain=true bo'lsa true, aks holda NULL. @unique -> bazada faqat bitta (TZ 4.7).
+  mainMarker Boolean? @unique
+  isActive   Boolean  @default(true)
+  createdAt  DateTime @default(now())
+  updatedAt  DateTime @updatedAt
+
+  users              UserBranch[]
+  inventory          BranchInventory[]
+  inventoryMovements InventoryMovement[]
+  reservations       StockReservation[]
+  orders             Order[]
+  deliveryZones      DeliveryZone[]
+  transfersOut       StockTransfer[]     @relation("TransferFrom")
+  transfersIn        StockTransfer[]     @relation("TransferTo")
+  notifications      Notification[]
+  auditLogs          AuditLog[]
+}
+
+/// Admin ↔ Branch (bitta admin bir nechta filialga biriktirilishi mumkin)
+model UserBranch {
+  userId    String
+  branchId  String
+  isPrimary Boolean  @default(false)
+  createdAt DateTime @default(now())
+
+  user   User   @relation(fields: [userId], references: [id], onDelete: Cascade)
+  branch Branch @relation(fields: [branchId], references: [id], onDelete: Cascade)
+
+  @@id([userId, branchId])
+  @@index([branchId])
+}
+
+// ============================================================================
+// 3. KATALOG (TZ 5, 6, 7)
+// ============================================================================
+
+/// 2 darajali (nested) kategoriya. Chuqurlik cheklovi service-code'da tekshiriladi.
+model Category {
+  id        String   @id @default(cuid())
+  name      String
+  slug      String   @unique
+  parentId  String?
+  sortOrder Int      @default(0)
+  isActive  Boolean  @default(true)
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  parent   Category?  @relation("CategoryTree", fields: [parentId], references: [id], onDelete: Restrict)
+  children Category[] @relation("CategoryTree")
+  products Product[] // implicit many-to-many: bitta mahsulot bir nechta kategoriyada
+
+  @@index([parentId])
+}
+
+model Product {
+  id String @id @default(cuid()) // ichki ID — public'da ishlatilmaydi
+
+  /// Public 4 xonali kod. Int sifatida saqlanadi, ko'rsatishda padStart(4, "0") → "0003".
+  /// Sequence orqali beriladi: immutable, hech qachon qayta ishlatilmaydi (hard delete yo'q).
+  /// 1..9999 chegarasi: service'da tekshiriladi (10000-kodni bermaslik).
+  productCode Int @unique @default(autoincrement())
+
+  name        String
+  description String? @db.Text
+
+  /// Katalog kartochkasidagi "dan" narx. Haqiqiy narx — ProductVariant.price (TZ 5.3)
+  basePrice Int
+
+  // Chegirma (Product darajasida). Muddati tugagach amal qilmaydi (query'da tekshiriladi).
+  discountType     DiscountType?
+  discountValue    Int?
+  discountStartsAt DateTime?
+  discountEndsAt   DateTime?
+
+  videoUrl         String?
+  fit              String?
+  seasons          String[] @default([])
+  careInstructions String? @db.Text
+  sizeChart        Json?
+  modelInfo        String? @db.Text
+  deliveryInfo     String? @db.Text
+  returnPolicy     String? @db.Text
+  // Eslatma: TZ 5.1 — hozircha material maydoni yo'q
+
+  status     ProductStatus @default(ACTIVE)
+  archivedAt DateTime?
+  createdAt  DateTime      @default(now())
+  updatedAt  DateTime      @updatedAt
+
+  categories      Category[]
+  images          ProductImage[]
+  variants        ProductVariant[]
+  orderItems      OrderItem[]
+  relatedProducts Product[]        @relation("RelatedProducts")
+  relatedTo       Product[]        @relation("RelatedProducts")
+  favoritedBy     Favorite[]
+
+  @@index([status, createdAt])
+  @@index([name(ops: raw("gin_trgm_ops"))], type: Gin) // case-insensitive qidiruv (ILIKE) uchun
+}
+
+model ProductImage {
+  id         String   @id @default(cuid())
+  productId  String
+  url        String
+  storageKey String // S3/MinIO object key
+  color      String? // qaysi rangga tegishli (ixtiyoriy)
+  altText    String?
+  sortOrder  Int      @default(0)
+  isMain     Boolean  @default(false)
+  createdAt  DateTime @default(now())
+
+  product Product @relation(fields: [productId], references: [id], onDelete: Cascade)
+
+  @@index([productId, sortOrder])
+}
+
+model ProductVariant {
+  id        String  @id @default(cuid())
+  productId String
+  sku       String  @unique
+  color     String
+  colorHex  String?
+  size      String
+
+  /// null bo'lsa Product.basePrice meros qilinadi. Checkout'da ishlatiladigan REAL narx (TZ 5.3).
+  price Int?
+
+  discountType     DiscountType?
+  discountValue    Int?
+  discountStartsAt DateTime?
+  discountEndsAt   DateTime?
+
+  isActive  Boolean  @default(true) // variant ham hard delete qilinmaydi
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  product       Product             @relation(fields: [productId], references: [id], onDelete: Restrict)
+  inventory     BranchInventory[]
+  movements     InventoryMovement[]
+  cartItems     CartItem[]
+  orderItems    OrderItem[]
+  reservations  StockReservation[]
+  transferItems StockTransferItem[]
+
+  @@unique([productId, color, size])
+  @@index([productId])
+}
+
+// ============================================================================
+// 4. OMBOR (TZ 7, 13)
+// ============================================================================
+
+/// available = onHand - reserved — ustun sifatida saqlanmaydi, so'rovda hisoblanadi (TZ 7.1)
+/// Invariant: onHand >= 0, reserved >= 0, reserved <= onHand — atomik `updateMany({ where: { onHand: { gte } } })` bilan ta'minlanadi
+model BranchInventory {
+  id                String   @id @default(cuid())
+  branchId          String
+  variantId         String
+  onHand            Int      @default(0)
+  reserved          Int      @default(0)
+  lowStockThreshold Int      @default(3)
+  updatedAt         DateTime @updatedAt
+
+  branch  Branch         @relation(fields: [branchId], references: [id], onDelete: Restrict)
+  variant ProductVariant @relation(fields: [variantId], references: [id], onDelete: Restrict)
+
+  @@unique([branchId, variantId])
+  @@index([variantId])
+}
+
+/// TZ 13.4 — har bir onHand o'zgarishi (immutable log)
+model InventoryMovement {
+  id         String                  @id @default(cuid())
+  branchId   String
+  variantId  String
+  oldOnHand  Int
+  newOnHand  Int
+  change     Int // newOnHand - oldOnHand
+  reason     InventoryMovementReason
+  note       String?
+  userId     String? // admin (tizim amali bo'lsa null)
+  orderId    String?
+  transferId String?
+  createdAt  DateTime                @default(now())
+
+  branch   Branch         @relation(fields: [branchId], references: [id], onDelete: Restrict)
+  variant  ProductVariant @relation(fields: [variantId], references: [id], onDelete: Restrict)
+  user     User?          @relation(fields: [userId], references: [id], onDelete: SetNull)
+  order    Order?         @relation(fields: [orderId], references: [id], onDelete: SetNull)
+  transfer StockTransfer? @relation(fields: [transferId], references: [id], onDelete: SetNull)
+
+  @@index([branchId, variantId, createdAt])
+  @@index([orderId])
+}
+
+/// TZ 13.2 — checkout paytida qisqa muddatli rezerv (default 15 daqiqa, SystemSetting'dan)
+model StockReservation {
+  id          String            @id @default(cuid())
+  orderItemId String            @unique
+  branchId    String
+  variantId   String
+  quantity    Int
+  status      ReservationStatus @default(ACTIVE)
+  expiresAt   DateTime
+  createdAt   DateTime          @default(now())
+  releasedAt  DateTime?
+
+  orderItem OrderItem      @relation(fields: [orderItemId], references: [id], onDelete: Cascade)
+  branch    Branch         @relation(fields: [branchId], references: [id], onDelete: Restrict)
+  variant   ProductVariant @relation(fields: [variantId], references: [id], onDelete: Restrict)
+
+  @@index([status, expiresAt]) // expiry cron uchun
+  @@index([branchId, variantId])
+}
+
+/// TZ 13.5 — keyingi bosqich (Phase 2)
+model StockTransfer {
+  id            String              @id @default(cuid())
+  fromBranchId  String
+  toBranchId    String
+  status        StockTransferStatus @default(REQUESTED)
+  note          String?
+  requestedById String
+  approvedById  String?
+  receivedById  String?
+  createdAt     DateTime            @default(now())
+  approvedAt    DateTime?
+  shippedAt     DateTime?
+  receivedAt    DateTime?
+  cancelledAt   DateTime?
+  updatedAt     DateTime            @updatedAt
+
+  fromBranch  Branch              @relation("TransferFrom", fields: [fromBranchId], references: [id], onDelete: Restrict)
+  toBranch    Branch              @relation("TransferTo", fields: [toBranchId], references: [id], onDelete: Restrict)
+  requestedBy User                @relation("TransferRequestedBy", fields: [requestedById], references: [id], onDelete: Restrict)
+  approvedBy  User?               @relation("TransferApprovedBy", fields: [approvedById], references: [id], onDelete: SetNull)
+  receivedBy  User?               @relation("TransferReceivedBy", fields: [receivedById], references: [id], onDelete: SetNull)
+  items       StockTransferItem[]
+  movements   InventoryMovement[]
+
+  @@index([fromBranchId, status])
+  @@index([toBranchId, status])
+}
+
+model StockTransferItem {
+  id         String @id @default(cuid())
+  transferId String
+  variantId  String
+  quantity   Int
+
+  transfer StockTransfer  @relation(fields: [transferId], references: [id], onDelete: Cascade)
+  variant  ProductVariant @relation(fields: [variantId], references: [id], onDelete: Restrict)
+
+  @@unique([transferId, variantId])
+}
+
+// ============================================================================
+// 5. SAVAT (TZ 9)
+// ============================================================================
+
+/// Narx/subtotal/total saqlanmaydi — har safar backend variantdan hisoblaydi (Never Trust the Client).
+model Cart {
+  id         String    @id @default(cuid())
+  userId     String?   @unique // ro'yxatdan o'tgan mijoz
+  guestToken String?   @unique // guest savat (cookie'dagi token)
+  expiresAt  DateTime? // guest savat uchun
+  createdAt  DateTime  @default(now())
+  updatedAt  DateTime  @updatedAt
+
+  user  User?      @relation(fields: [userId], references: [id], onDelete: Cascade)
+  items CartItem[]
+}
+
+model CartItem {
+  id        String   @id @default(cuid())
+  cartId    String
+  variantId String
+  quantity  Int
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  cart    Cart           @relation(fields: [cartId], references: [id], onDelete: Cascade)
+  variant ProductVariant @relation(fields: [variantId], references: [id], onDelete: Cascade)
+
+  // Bir xil variant qayta qo'shilsa duplicate yo'q — quantity oshadi (TZ 9)
+  @@unique([cartId, variantId])
+}
+
+// ============================================================================
+// 6. MANZIL VA YETKAZIB BERISH (TZ 10, 14)
+// ============================================================================
+
+/// userId != null — mijozning saqlangan manzili.
+/// Order har doim o'z nusxasini (snapshot) yaratadi, shunda keyin manzil o'zgarsa ham eski order o'zgarmaydi.
+model Address {
+  id            String        @id @default(cuid())
+  userId        String?
+  recipientName String
+  phone         String
+  region        String
+  district      String
+  mahalla       String?
+  street        String?
+  house         String?
+  apartment     String?
+  note          String?
+  latitude      Float?
+  longitude     Float?
+  method        AddressMethod @default(MANUAL)
+  isDefault     Boolean       @default(false)
+  createdAt     DateTime      @default(now())
+
+  user   User?   @relation(fields: [userId], references: [id], onDelete: Cascade)
+  orders Order[]
+
+  @@index([userId])
+}
+
+/// TZ 14 — Toshkent shahri 30 000, Samarqand shahri 20 000, Boshqa hududlar 40 000.
+/// branchId null — global zona. isDefault = "Boshqa hududlar" (fallback).
+model DeliveryZone {
+  id        String   @id @default(cuid())
+  name      String
+  region    String?
+  district  String?
+  fee       Int
+  isDefault Boolean  @default(false)
+  isActive  Boolean  @default(true)
+  branchId  String?
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  branch     Branch?    @relation(fields: [branchId], references: [id], onDelete: Cascade)
+  deliveries Delivery[]
+
+  @@index([region, district])
+  @@index([branchId])
+}
+
+model Delivery {
+  id             String         @id @default(cuid())
+  orderId        String         @unique
+  zoneId         String?
+  fee            Int // order paytidagi snapshot
+  status         DeliveryStatus @default(PENDING)
+  courierName    String?
+  courierPhone   String?
+  trackingNumber String?
+  note           String?
+  shippedAt      DateTime?
+  deliveredAt    DateTime?
+  createdAt      DateTime       @default(now())
+  updatedAt      DateTime       @updatedAt
+
+  order Order         @relation(fields: [orderId], references: [id], onDelete: Restrict)
+  zone  DeliveryZone? @relation(fields: [zoneId], references: [id], onDelete: SetNull)
+
+  @@index([status])
+}
+
+// ============================================================================
+// 7. BUYURTMA (TZ 11)
+// ============================================================================
+
+model Order {
+  id          String @id @default(cuid())
+  orderNumber String @unique // mijozga ko'rinadigan raqam (tracking uchun)
+
+  /// Guest checkout: userId = null. Ism/telefon har doim snapshot sifatida saqlanadi.
+  /// Guest tracking: orderNumber + customerPhone (TZ 11.6).
+  userId        String?
+  customerName  String
+  customerPhone String
+
+  status        OrderStatus   @default(PENDING_PAYMENT)
+  paymentStatus PaymentStatus @default(PENDING)
+  source        OrderSource   @default(WEBSITE)
+
+  // UTM (TZ 20)
+  utmSource   String?
+  utmCampaign String?
+  utmContent  String?
+
+  // Barchasi backend tomonidan hisoblanadi
+  subtotal      Int // Σ originalPrice × quantity
+  discountTotal Int @default(0)
+  deliveryFee   Int @default(0)
+  total         Int // subtotal - discountTotal + deliveryFee
+
+  /// null — hali biriktirilmagan yoki MANUAL_REVIEW (TZ 11.3). MVP: bitta order = bitta filial.
+  branchId  String?
+  addressId String
+
+  cancelReason String?
+  paidAt       DateTime?
+  cancelledAt  DateTime?
+  createdAt    DateTime  @default(now())
+  updatedAt    DateTime  @updatedAt
+
+  user          User?                @relation(fields: [userId], references: [id], onDelete: SetNull)
+  branch        Branch?              @relation(fields: [branchId], references: [id], onDelete: Restrict)
+  address       Address              @relation(fields: [addressId], references: [id], onDelete: Restrict)
+  items         OrderItem[]
+  payments      Payment[]
+  delivery      Delivery?
+  statusHistory OrderStatusHistory[]
+  movements     InventoryMovement[]
+  notifications Notification[]
+
+  @@index([branchId, status, createdAt])
+  @@index([userId, createdAt])
+  @@index([customerPhone])
+  @@index([status, paymentStatus])
+  @@index([createdAt])
+}
+
+model OrderItem {
+  id        String @id @default(cuid())
+  orderId   String
+  productId String
+  variantId String
+  quantity  Int
+
+  /// Order paytidagi o'zgarmas snapshot'lar (TZ 5.3)
+  originalPrice Int // chegirmagacha (variant narxi)
+  actualPrice   Int // haqiqiy narx (chegirmadan keyin), 1 dona uchun
+
+  // Mahsulot keyin o'zgarsa ham tarix buzilmasligi uchun
+  productCode Int
+  productName String
+  sku         String
+  color       String
+  size        String
+
+  order       Order             @relation(fields: [orderId], references: [id], onDelete: Cascade)
+  product     Product           @relation(fields: [productId], references: [id], onDelete: Restrict)
+  variant     ProductVariant    @relation(fields: [variantId], references: [id], onDelete: Restrict)
+  reservation StockReservation?
+
+  @@index([orderId])
+  @@index([productId])
+  @@index([variantId])
+}
+
+model OrderStatusHistory {
+  id          String       @id @default(cuid())
+  orderId     String
+  fromStatus  OrderStatus?
+  toStatus    OrderStatus
+  changedById String? // null — tizim (webhook, cron)
+  note        String?
+  createdAt   DateTime     @default(now())
+
+  order     Order @relation(fields: [orderId], references: [id], onDelete: Cascade)
+  changedBy User? @relation(fields: [changedById], references: [id], onDelete: SetNull)
+
+  @@index([orderId, createdAt])
+}
+
+// ============================================================================
+// 8. TO'LOV (TZ 12)
+// ============================================================================
+
+/// Bitta order uchun bir nechta urinish bo'lishi mumkin (Payme → Click).
+/// Order.paymentStatus — eng so'nggi holatning denormalizatsiyasi (bitta tranzaksiyada yangilanadi).
+model Payment {
+  id                    String          @id @default(cuid())
+  orderId               String
+  provider              PaymentProvider
+  status                PaymentStatus   @default(PENDING)
+  amount                Int
+  refundedAmount        Int             @default(0)
+  currency              String          @default("UZS")
+  providerTransactionId String? // provayder tomonidagi tranzaksiya ID
+  failureReason         String?
+  expiresAt             DateTime?
+  paidAt                DateTime?
+  /// status=PAID bo'lsa true, aks holda NULL. @@unique([orderId, paidMarker]) -> order uchun faqat bitta PAID (TZ 12, 27.4).
+  paidMarker            Boolean?
+  createdAt             DateTime        @default(now())
+  updatedAt             DateTime        @updatedAt
+
+  order        Order                @relation(fields: [orderId], references: [id], onDelete: Restrict)
+  transactions PaymentTransaction[]
+
+  @@unique([provider, providerTransactionId])
+  @@unique([orderId, paidMarker])
+  @@index([orderId])
+  @@index([status, createdAt])
+}
+
+/// Provayder bilan har bir o'zaro aloqa (webhook, refund va h.k.) — audit + idempotency
+model PaymentTransaction {
+  id             String                   @id @default(cuid())
+  paymentId      String
+  provider       PaymentProvider
+  type           PaymentTransactionType
+  status         PaymentTransactionStatus @default(RECEIVED)
+  amount         Int
+  /// Masalan `${provider}:${providerTxnId}:${type}` — bir xil webhook ikki marta ishlanmaydi (TZ 12)
+  idempotencyKey String                   @unique
+  signatureValid Boolean?
+  rawPayload     Json?
+  errorMessage   String?
+  createdAt      DateTime                 @default(now())
+
+  payment Payment @relation(fields: [paymentId], references: [id], onDelete: Restrict)
+
+  @@index([paymentId, createdAt])
+}
+
+// ============================================================================
+// 9. NOTIFICATION, AUDIT, SOZLAMALAR (TZ 18, 20, 28)
+// ============================================================================
+
+/// TZ 20.1 — NotificationService → Adapter (Telegram/Email/SMS/Push).
+/// Ichki (Admin) xabarlar ham, mijozga SMS ham shu jadvalda.
+model Notification {
+  id        String              @id @default(cuid())
+  type      NotificationType
+  channel   NotificationChannel @default(TELEGRAM)
+  status    NotificationStatus  @default(PENDING)
+  branchId  String?
+  orderId   String?
+  recipient String? // telefon / chat id / email
+  message   String?             @db.Text
+  payload   Json?
+  attempts  Int                 @default(0)
+  lastError String?
+  sentAt    DateTime?
+  createdAt DateTime            @default(now())
+
+  branch Branch? @relation(fields: [branchId], references: [id], onDelete: SetNull)
+  order  Order?  @relation(fields: [orderId], references: [id], onDelete: SetNull)
+
+  @@index([status, createdAt])
+  @@index([type, createdAt])
+}
+
+/// TZ 18 — password, refreshTokenHash kabi maydonlar oldValue/newValue'ga yozilishidan oldin redact qilinadi.
+model AuditLog {
+  id        String      @id @default(cuid())
+  userId    String? // FAILED_LOGIN'da noma'lum bo'lishi mumkin
+  action    AuditAction
+  entity    String // "Product", "Order", "User", ...
+  entityId  String?
+  oldValue  Json?
+  newValue  Json?
+  branchId  String?
+  ipAddress String?
+  userAgent String?
+  createdAt DateTime    @default(now())
+
+  user   User?   @relation(fields: [userId], references: [id], onDelete: SetNull)
+  branch Branch? @relation(fields: [branchId], references: [id], onDelete: SetNull)
+
+  @@index([entity, entityId])
+  @@index([userId, createdAt])
+  @@index([action, createdAt])
+  @@index([branchId, createdAt])
+}
+
+/// Global sozlamalar (SYSTEM_SETTINGS_*): masalan `stock.reservation.ttlMinutes` = 15
+model SystemSetting {
+  key         String   @id
+  value       Json
+  description String?
+  updatedById String?
+  updatedAt   DateTime @updatedAt
+
+  updatedBy User? @relation(fields: [updatedById], references: [id], onDelete: SetNull)
+}
