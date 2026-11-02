@@ -1,13 +1,13 @@
 "use client";
 
-import { useEffect, useState } from "react";
+import { Suspense, useEffect, useState } from "react";
 import { useRouter, useSearchParams } from "next/navigation";
 import { Button } from "@/components/button";
 import { PasswordInput } from "@/components/password-input";
 import { Logo } from "@/components/logo";
 import { useAuth, ApiError } from "@/lib/auth-context";
 
-export default function AdminLoginPage() {
+function AdminLoginContent() {
   const { user, loading: authLoading, login } = useAuth();
   const router = useRouter();
   const searchParams = useSearchParams();
@@ -65,5 +65,12 @@ export default function AdminLoginPage() {
         </form>
       </div>
     </div>
+  );
+}
+export default function AdminLoginPage() {
+  return (
+    <Suspense fallback={<div className="py-16 text-center">Yuklanmoqda...</div>}>
+      <AdminLoginContent />
+    </Suspense>
   );
 }

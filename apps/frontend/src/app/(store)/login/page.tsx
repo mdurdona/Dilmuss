@@ -1,13 +1,14 @@
+
 "use client";
 
-import { useState } from "react";
+import { Suspense, useState } from "react";
 import Link from "next/link";
 import { useRouter, useSearchParams } from "next/navigation";
 import { Button } from "@/components/button";
 import { PasswordInput } from "@/components/password-input";
 import { useAuth, ApiError } from "@/lib/auth-context";
 
-export default function LoginPage() {
+function LoginContent() {
   const { login } = useAuth();
   const router = useRouter();
   const searchParams = useSearchParams();
@@ -62,5 +63,13 @@ export default function LoginPage() {
         </p>
       </form>
     </div>
+  );
+}
+
+export default function LoginPage() {
+  return (
+    <Suspense fallback={<div className="py-16 text-center">Yuklanmoqda...</div>}>
+      <LoginContent />
+    </Suspense>
   );
 }

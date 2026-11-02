@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useState } from "react";
+import { Suspense, useEffect, useState } from "react";
 import Link from "next/link";
 import { useRouter, useSearchParams } from "next/navigation";
 import { Button } from "@/components/button";
@@ -10,7 +10,7 @@ import { apiPost } from "@/lib/api";
 
 type Step = "details" | "otp" | "password";
 
-export default function RegisterPage() {
+function RegisterContent() {
   const { register } = useAuth();
   const router = useRouter();
   const searchParams = useSearchParams();
@@ -165,5 +165,12 @@ export default function RegisterPage() {
         </form>
       )}
     </div>
+  );
+}
+export default function RegisterPage() {
+  return (
+    <Suspense fallback={<div className="py-16 text-center">Yuklanmoqda...</div>}>
+      <RegisterContent />
+    </Suspense>
   );
 }
